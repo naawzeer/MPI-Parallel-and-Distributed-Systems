@@ -1,323 +1,199 @@
-#include <limits.h>
+#include <mpi.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <time.h>
+#include <string.h>
+#include <math.h>  
 #include <stdbool.h>
 
-typedef struct NODE Node;
-
-struct NODE {
-	int key;
-	Node* smaller_keys;
-	Node* larger_keys;
-};
-
-typedef struct {
-	Node* root;
-}Tree;
-
-void tree_create(Tree** tree)
+void reduce_tree(
+    int* send_data,
+    int* recv_data,
+    int count,
+    MPI_Comm communicator)
 {
-	*tree = (Tree*)malloc(sizeof(Tree));
-	(*tree)->root = NULL;
+    int my_rank;
+    int com_size;
+    MPI_Comm_rank(communicator, &my_rank);
+    MPI_Comm_size(communicator, &com_size);
+
+    int* my_partial_sum;
+    if (my_rank == 0)
+        my_partial_sum = recv_data;
+    else
+        my_partial_sum = (int*)malloc(count * sizeof(int));
+
+    memcpy(my_partial_sum, send_data, count * sizeof(int));
+    
+    int my_parent_rank = (my_rank - 1) / 2;
+    int left_child_rank = 2 * my_rank + 1;
+    int right_child_rank = 2 * my_rank + 2;
+
+    bool left_child_exists = left_child_rank < com_size;
+    bool right_child_exists = right_child_rank < com_size;
+
+
+    int* left_child_recv_buffer = NULL;
+    MPI_Request left_child_request = MPI_REQUEST_NULL;
+    if (left_child_exists)
+    {
+        left_child_recv_buffer = (int*)malloc(count* sizeof(int));
+        MPI_Irecv(left_child_recv_buffer, count, MPI_INT, 
+            left_child_rank, 0, communicator, &left_child_request);
+    }
+
+    int* right_child_recv_buffer = NULL;
+    MPI_Request right_child_request = MPI_REQUEST_NULL;
+    if (right_child_exists)
+    {
+        right_child_recv_buffer = (int*)malloc(count * sizeof(int));
+        MPI_Irecv(right_child_recv_buffer, count, MPI_INT,
+            right_child_rank, 0, communicator, &right_child_request);
+    }
+
+    if (left_child_exists)
+    {
+        MPI_Wait(&left_child_request, MPI_STATUS_IGNORE);
+        for (int i = 0; i < count; i++)
+            my_partial_sum[i] += left_child_recv_buffer[i];
+        free(left_child_recv_buffer);
+    }
+
+    if (right_child_exists)
+    {
+        MPI_Wait(&right_child_request, MPI_STATUS_IGNORE);
+        for (int i = 0; i < count; i++)
+            my_partial_sum[i] += right_child_recv_buffer[i];
+        free(right_child_recv_buffer);
+    }
+
+    if (my_rank != 0)
+    {
+        MPI_Send(my_partial_sum, count, MPI_INT, my_parent_rank, 0, communicator);
+        free(my_partial_sum);
+    }
 }
 
-// Alternative: No dynamic allocation, only initialization
-// In this case, the caller is responosible for allocating
-// the tree structure
-void tree_create_only_init(Tree* tree)
+void reduce_sequential(
+    int* send_data,
+    int* recv_data,
+    int count,
+    MPI_Comm communicator)
 {
-	tree->root = NULL;
-}
+    int my_rank;
+    int com_size;
+    MPI_Comm_rank(communicator, &my_rank);
+    MPI_Comm_size(communicator, &com_size);
 
+    int* gather_buffer = NULL;
+    if (my_rank == 0)
+    {
+        gather_buffer = (int*) calloc(count * com_size, sizeof(int));
+    }
 
-void node_create(Node** node, int key)
-{
-	*node = (Node*)malloc(sizeof(Node));
-	(*node)->larger_keys = NULL;
-	(*node)->smaller_keys = NULL;
-	(*node)->key = key;
-}
+    MPI_Gather(send_data, count, MPI_INT, gather_buffer, count, MPI_INT, 0, communicator);
 
-
-
-void tree_insert_key(Tree* tree, int key)
-{
-	if(tree->root == NULL)
-	{
-		node_create(&tree->root, key);	
-		return;
-	}
-	
-	Node* it_n = tree->root;
-	while (true)
-	{
-		if (it_n->key < key)
-		{
-			if(it_n->left_child == NULL)
-			{
-				node_create(&it_n->left_child, key);
-				return;
-			}
-			else
-				it_n = it_n->left_child;
-
-		}		
-		else if (it_n->key > key)
-		{
-			if(it_n->right_child == NULL)
-			{
-				node_create(&it_n->right_child, key);
-				return;
-			}
-			else
-				it_n = it_n->right_child;
-
-		}
-		else 
-			return;
-	}
-}
-
-
-// Alternative: Using a pointer on the pointer, which
-// points on the next node to traverse or the new node
-// to create. By this, the conditionals can be simplified.
-void tree_insert_key(Tree* tree, int key)
-{
-	Node** it_n = &tree->root;
-	while (true)
-	{
-		if (*it_n == NULL)
-		{
-			node_create(it_n, key);
-			return;
-		}
-
-		if ((*it_n)->key == key)
-			return;
-
-		it_n = key < (*it_n)->key ?
-			   &((*it_n)->smaller_keys) : 
-			   &((*it_n)->larger_keys);
-	}
-}
-
-Node* subtree_find_key_recursive(Node* subtree, int key)
-{
-	if (subtree == NULL)
-		return NULL;
-
-	if (subtree->key == key)
-		return subtree;
-
-	return subtree_find_key_recursive(key < subtree->key ? 
-		subtree->smaller_keys : subtree->larger_keys, key);
-}
-
-Node* tree_find_key_recursive(Tree* tree, int key)
-{
-	return subtree_find_key_recursive(tree->root, key);
-}
-
-Node* tree_find_key_iterative(Tree* tree, int key)
-{
-	Node* it_n = tree->root;
-	while (true)
-	{
-		if (it_n == NULL)
-			return NULL;
-
-		if (it_n->key == key)
-			return it_n;
-
-		it_n = key < it_n->key ? it_n->smaller_keys : it_n->larger_keys;
-	}
-}
-
-bool subtree_is_valid(Node* subtree, int min_bound, int max_bound)
-{
-	if (subtree == NULL)
-		return true;
-
-	int key = subtree->key;
-	if (key < min_bound || key > max_bound)
-		return false;
-
-	return
-		subtree_is_valid(subtree->smaller_keys, min_bound, key - 1) &&
-		subtree_is_valid(subtree->larger_keys, key + 1, max_bound);
-}
-
-bool tree_is_valid(Tree* tree)
-{
-	return subtree_is_valid(tree->root, INT_MIN, INT_MAX);
-}
-
-void subtree_deep_copy(Node** new_subtree, Node* old_subtree)
-{
-	if (old_subtree == NULL)
-		return;
-
-	node_create(new_subtree, old_subtree->key);
-	subtree_deep_copy(&((*new_subtree)->smaller_keys), old_subtree->smaller_keys);
-	subtree_deep_copy(&((*new_subtree)->larger_keys), old_subtree->larger_keys);
-}
-
-void tree_deep_copy(Tree** new_tree, Tree* old_tree)
-{
-	tree_create(new_tree);
-	subtree_deep_copy(&(*new_tree)->root, old_tree->root);
-}
-
-void subtree_delete(Node* subtree)
-{
-	if (subtree == NULL)
-		return;
-
-	subtree_delete(subtree->smaller_keys);
-	subtree_delete(subtree->larger_keys);
-
-	free(subtree);
-}
-
-void tree_delete(Tree* tree)
-{
-	subtree_delete(tree->root);
+    if (my_rank == 0)
+    {
+        memset(recv_data, 0, count * sizeof(int));
+        for (int p = 0; p < com_size; p++)
+            for (int i = 0; i < count; i++)
+                recv_data[i] += gather_buffer[count * p + i];
+        free(gather_buffer);
+    }
 }
 
 
 
 int main(int argc, char** args)
 {
-	int key_count = 1000;
-	int max_key = 3000;
-	int min_key = -3000;
+    MPI_Init(&argc, &args);
+    int count = 1024;
+    int max_value = 64;
+    int* recv_array_tree = NULL;
+    int* recv_array_sequential = NULL;
 
-	int* keys = (int*)malloc(sizeof(int) * key_count);
-	int* non_keys = (int*)malloc(sizeof(int) * key_count);
-	srand((unsigned int)time(NULL));
+    int my_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    if (my_rank == 0)
+    {
+        recv_array_tree = (int*) malloc(count * sizeof(int));
+        recv_array_sequential = (int*) malloc(count * sizeof(int));
+    }
 
-	Tree* t_1; tree_create(&t_1);
-	Tree* t_inv; tree_create(&t_inv);
+    int* send_array = (int*)malloc(count * sizeof(int));
+    for (int i = 0; i < count; i++)
+        send_array[i] = my_rank;
 
+    reduce_tree(send_array, recv_array_tree, count, MPI_COMM_WORLD);
+    reduce_sequential(send_array, recv_array_sequential, count, MPI_COMM_WORLD);
 
-	for (int i = 0; i < key_count; i++)
-	{
-		keys[i] = rand() % (max_key - min_key) - min_key;
+    if (my_rank == 0)
+    {
+        for (int i = 0; i < count; i++)
+            if (recv_array_tree[i] != recv_array_sequential[i])
+                printf("At index %i: reduce_tree is %i, reduce_sequential is %i\n",
+                    i, recv_array_tree[i], recv_array_sequential[i]);
 
-		bool key_added_before = false;
-		for (int j = 0; j < i; j++)
-			if (keys[j] == keys[i])
-				key_added_before = true;
-
-		if (key_added_before)
-			i--;
-	}
-
-	for (int i = 0; i < key_count; i++)
-	{
-		non_keys[i] = rand() % (max_key - min_key) - min_key;
-
-		bool key_added = false;
-		for (int j = 0; j < key_count; j++)
-			if (non_keys[i] == keys[j])
-				key_added = true;
-
-		if (key_added)
-			i--;
-	}
-
-	for (int i = 0; i < key_count; i++)
-	{
-		tree_insert_key(t_1, keys[i]);
-		tree_insert_key(t_2, keys[i]);
-		tree_insert_key(t_inv, keys[i]);
-	}
-
-	for (int i = 0; i < key_count; i++)
-		if (tree_find_key_recursive(t_1, keys[i]) == NULL)
-			printf("ERROR! Insterted key not found recursively!\n");
-
-	for (int i = 0; i < key_count; i++)
-		if (tree_find_key_recursive(t_1, non_keys[i]) != NULL)
-			printf("ERROR! Uninserted key found recursively!\n");
-
-	for (int i = 0; i < key_count; i++)
-		if (tree_find_key_iterative(t_1, keys[i]) == NULL)
-			printf("ERROR! Inserted key not found iteratively!\n");
-
-	for (int i = 0; i < key_count; i++)
-		if (tree_find_key_iterative(t_1, non_keys[i]) != NULL)
-			printf("ERROR! Uninserted key found recursively!\n");
-
-
-	if (tree_is_valid(t_1) != true)
-		printf("ERROR! VALID TREE CONSIDERED INVALID!\n");
-
-	for (int test_id = 0; test_id < 1000; test_id++)
-	{
-		int path_length = rand() % 10;
-		Node* node_inv = t_inv->root;
-		for (int i = 0; i < path_length; i++)
-		{
-			if (node_inv->larger_keys == NULL || node_inv->smaller_keys == NULL)
-				break;
-
-			Node* new_node;
-
-			if (rand() % 2)
-				new_node = node_inv->larger_keys;
-			else
-				new_node = node_inv->smaller_keys;
-
-			if (new_node != NULL)
-				node_inv = new_node;
-		}
-		 
-		Node* node_it = node_inv->smaller_keys;
-		if (node_it != NULL)
-		{
-			while (node_it->larger_keys != NULL)
-				node_it = node_it->larger_keys;
-
-			int old_key = node_it->key;
-			node_it->key = node_inv->key;
-			if (tree_is_valid(t_inv) == true)
-				printf("ERROR! INVALID TREE CONSIDERED VALID!\n");
-			node_inv->key = old_key;
-		}
-
-		node_it = node_inv->larger_keys;
-		if (node_it != NULL)
-		{
-			while (node_it->smaller_keys != NULL)
-				node_it = node_it->smaller_keys;
-
-			int old_key = node_it->key;
-			node_it->key = node_inv->key;
-			if (tree_is_valid(t_inv) == true)
-				printf("ERROR! Invalid tree considered valid!\n");
-			node_it->key = old_key;
-		}
-	}
-
-
-	Tree* t_copy;
-	tree_deep_copy(&t_copy, t_1);
-	for (int i = 0; i < key_count; i++)
-		if (tree_find_key_recursive(t_copy, keys[i]) == NULL)
-			printf("ERROR! Key lost by copying tree!\n");
-
-	if (tree_is_valid(t_copy) != true)
-		printf("ERROR! DEPP COPY CONSIDERED INVALID!\n");
-		
-	free(keys);
-	free(non_keys);
-	
-	tree_delete(t_1);
-	tree_delete(t_inv);	
-	tree_delete(t_copy);	
-		
-	return 0;
+        free(recv_array_tree);
+        free(recv_array_sequential);
+    }
+    free(send_array);
+    MPI_Finalize();
+    return 0;
 }
+
+
+// Subtask d)
+//
+// General assumption:
+//    - For small arrays: Startup time dominates the runtime of a communication operation
+//    - For large arrays: Bandwidth dominates the runtime of a communication operation
+//      
+// In the following: 
+//      - We assume that our cluster has a star topology, i.e. a central network hub with a 
+//        connection to each node of the cluster
+//      - BW denotes the bandwidth of a connection from the central hub to a node
+//        of the network
+//                  
+//
+// Performance estimation for reduce_sequential: 
+//      - Performance depends on the implementation of MPI_Gather
+//      - If we assume that MPI_Gather establishes all connections concurrently in order to 
+//        reduce the impact of the startup time, its total runtime can be estimated as: 
+//   
+//          t_total = count * sizeof(int) * (com_size - 1)  / BW + t_startup
+// 
+//      - This is because the data from all other nodes, which is in total 
+//        count * sizeof(int) * (com_size-1) Bytes, has to transmitted across a single
+//        connection from the central hub to the root node.
+//      - While all nodes may potentially send their data to the central hub utilizing the
+//        full bandwidth of their connection, all this data has pass through the connection
+//        from the central hub to the root node
+//      ->The connection from the central hub to the root node becomes a bottleneck
+// 
+// Performance estimation for the reduce_tree: 
+//      - This implementation reduces the levels of the tree one after another
+//      - Estimated runtime for each level of the tree:
+//              t_level = 2 * count * sizeof(int) / BW + t_startup
+//        - That is because:
+//              - All children of a level may send data to their respective parent node in
+//                parallel.
+//              - While the two children of a parent node can potentially send their data to
+//                the central hub utilizing the full bandwidth of both of their connections, 
+//                their parent node can only recieve data from both of its children 
+//                utilizing the bandwidth of its single connection.
+//       
+//      - Estimated runtime for the whole reduction operation:
+//              t_total = (h - 1) * t_level 
+//                      = 2 * count * sizeof(int) * (h - 1) / BW + (h - 1) * t_startup
+//          with h being the height of the tree, which is log_2(com_size + 1)
+//
+//  - Comparision:
+//      - For smaller arrays only consider impact of startup time on the runtime:
+//          - reduce_sequential: t_startup 
+//          - reduce_tree: (log_2(com_size + 1) - 1) * t_startup  
+//          -> prefer reduce_sequential for smaller arrays
+//      - For larger arrays only consider impact of bandwidth on the runtime:
+//          - reduce_sequential: count * sizeof(int) * (com_size - 1) / BW
+//          - reduce_tree:  2 * count * sizeof(int) * (log_2(com_size + 1) - 1) / BW
+//          -> prefer reduce_tree for larger arrays
